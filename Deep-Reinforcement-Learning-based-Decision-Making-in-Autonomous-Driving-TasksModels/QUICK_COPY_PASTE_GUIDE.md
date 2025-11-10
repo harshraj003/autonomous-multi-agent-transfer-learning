@@ -217,3 +217,24 @@ for idx, v in enumerate(wrapper.unwrapped.road.vehicles[:5]):
 5. Confirm alpha values change between episodes and are different per follower
 
 For more details, see `CELL_19_FIXES.md`
+
+---
+
+## Cell 25 - Final Results Display (NEW!)
+
+A comprehensive, beautiful display cell that shows:
+- **3 videos side-by-side** with live α values
+- **Alpha evolution plot** with 4 distinct follower lines
+- **Performance summary table** highlighting best episode
+- **Per-follower alpha comparison** charts
+- **Safety metrics** and sync events visualization
+- **Detailed conclusion** with key findings
+
+Copy the complete code from `cell_25_final_results.txt` into Cell 25 of your notebook.
+
+### Usage:
+1. Run Cell 23 (generates videos and CSV)
+2. Run Cell 25 (displays comprehensive results)
+
+This cell provides publication-ready visualizations of your multi-agent adaptive trust learning experiment!
+
