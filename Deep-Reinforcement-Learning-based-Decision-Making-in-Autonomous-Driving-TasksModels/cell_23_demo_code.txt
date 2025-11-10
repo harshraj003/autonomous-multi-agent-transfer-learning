@@ -1,0 +1,243 @@
+# CELL 19 – FULL DEMO (highway-v0) – FIXED VERSION
+import numpy as np
+import torch
+import os
+import glob
+import pandas as pd
+import random
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
+import gc
+
+# ----------------------------------------------------------------------
+# 1. Sigmoid
+# ----------------------------------------------------------------------
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+# ----------------------------------------------------------------------
+# 2. Rename checkpoint keys
+# ----------------------------------------------------------------------
+def rename_checkpoint_keys(sd):
+    rename_map = {
+        'fc1.weight': 'net.0.weight', 'fc1.bias': 'net.0.bias',
+        'fc2.weight': 'net.2.weight', 'fc2.bias': 'net.2.bias',
+        'fc3.weight': 'net.4.weight', 'fc3.bias': 'net.4.bias',
+    }
+    return {rename_map.get(k, k): v for k, v in sd.items()}
+
+# ----------------------------------------------------------------------
+# 3. Resize first layer (5 → 25)
+# ----------------------------------------------------------------------
+def resize_agent_first_layer(agent):
+    w = agent.own_qnet_local.net[0].weight
+    if w.shape[1] != 5:
+        return
+    print(f"Resizing first layer: {w.shape} → (125, 25)")
+    new_layer = torch.nn.Linear(25, 125).to(w.device)
+    with torch.no_grad():
+        new_layer.weight.zero_()
+        new_layer.weight[:, :5].copy_(w)
+        new_layer.bias.copy_(agent.own_qnet_local.net[0].bias)
+    agent.own_qnet_local.net[0] = new_layer
+    agent.own_qnet_target.net[0] = new_layer
+
+# ----------------------------------------------------------------------
+# 4. Load agent
+# ----------------------------------------------------------------------
+models_dir = os.path.join(path_HW5, "Models", "multi_agent_adaptive")
+def load_agent(agent, pattern):
+    files = sorted(glob.glob(os.path.join(models_dir, pattern)))
+    if not files:
+        return False
+    ckpt = torch.load(files[-1], map_location=device)
+    sd = ckpt.get('own_local') or ckpt.get('state_dict') or ckpt
+    sd = rename_checkpoint_keys(sd)
+    agent.own_qnet_local.load_state_dict(sd, strict=True)
+    agent.own_qnet_target.load_state_dict(sd, strict=True)
+    agent.alpha = float(ckpt.get('alpha', 0.5))
+    print(f"Loaded {pattern} (α={agent.alpha:.2f})")
+    return True
+
+# ----------------------------------------------------------------------
+# 5. Instantiate + load + resize
+# ----------------------------------------------------------------------
+leader = AdaptiveTrustAgent(5, 5, is_leader=True, seed=11)
+followers = [AdaptiveTrustAgent(5, 5, is_leader=False, leader_agent=leader,
+                                color=c, seed=12+i)
+             for i, c in enumerate(['blue','green','yellow','purple'])]
+
+load_agent(leader, "leader*.pth")
+resize_agent_first_layer(leader)
+for i, f in enumerate(followers, 1):
+    load_agent(f, f"follower{i}*.pth")
+    resize_agent_first_layer(f)
+
+# ----------------------------------------------------------------------
+# 6. Environment – HIGHWAY-V0 with lots of traffic
+# ----------------------------------------------------------------------
+base_cfg = {
+    "lanes_count": 4,
+    "vehicles_count": 40,          # many grey background cars
+    "duration": 120,
+    "observation": {"type": "Kinematics"},
+    "action": {"type": "DiscreteMetaAction"},
+}
+
+# ----------------------------------------------------------------------
+# 7. Demo episodes with FIXED REWARDS and ALPHA UPDATES
+# ----------------------------------------------------------------------
+video_dir = os.path.join(path_HW5, "Videos")
+os.makedirs(video_dir, exist_ok=True)
+
+# History dict for CSV output
+alpha_hist = {
+    "episode": [], "alpha_b": [], "alpha_g": [], "alpha_y": [], "alpha_p": [],
+    "syncs": [], "safe_steps": [], "crash": []
+}
+
+eps_demo = 0.07          # tiny exploration → safe driving
+SYNC_EVERY = 5           # sync leader brain to followers every 5 steps
+
+for ep in range(1, 4):
+    print(f"\n{'='*60}")
+    print(f"Episode {ep}/3")
+    print('='*60)
+    
+    # Create fresh environment for this episode
+    base = gym.make('highway-v0', render_mode='rgb_array', config=base_cfg)
+    wrapper = ColoredMultiAgentWrapper(base, n_agents=5)
+    
+    # Wrap with RecordVideo
+    rec = RecordVideo(
+        wrapper,
+        video_dir,
+        name_prefix=f"EP{ep}",
+        episode_trigger=lambda _: True
+    )
+    
+    # Reset environment
+    obs_list, _ = rec.reset()
+    obs_list = [np.pad(o[:5], (0, 20)) for o in obs_list]
+    
+    # Initialize tracking variables
+    done = False
+    t = 0
+    safe_steps = 0
+    syncs = 0
+    crashed = False
+    
+    # Track rewards for alpha update
+    leader_rewards = []
+    follower_rewards = [[] for _ in range(4)]
+    
+    # Initial alpha values (can be from previous episodes or default)
+    current_alphas = [f.alpha for f in followers]
+    
+    while not done and t < 1500:
+        # ---- Get actions with tiny exploration --------------------------------
+        act_l = leader.act(obs_list[0], eps=eps_demo)
+        acts = [int(np.clip(act_l, 0, 4))]
+        for i, f in enumerate(followers):
+            act_f = f.act(obs_list[i+1], eps=eps_demo)
+            acts.append(int(np.clip(act_f, 0, 4)))
+        
+        # ---- Step environment through RecordVideo wrapper --------------------
+        # This properly records frames and handles termination
+        obs_raw, _, terminated, truncated, _ = rec.step(acts)
+        done = terminated or truncated
+        
+        # Update observations for next step
+        obs_list = [np.pad(o[:5], (0, 20)) for o in obs_raw]
+        
+        # ---- Calculate per-agent rewards from vehicle states ----------------
+        rs = []
+        for idx, v in enumerate(wrapper.unwrapped.road.vehicles[:5]):
+            r = 0.0
+            if getattr(v, "crashed", False):
+                r -= 20.0
+                if not crashed:
+                    crashed = True
+            else:
+                r += v.speed / 30.0  # normalize speed reward
+            rs.append(float(r))
+        
+        # Store rewards for alpha update
+        leader_rewards.append(rs[0])
+        for i in range(4):
+            follower_rewards[i].append(rs[i+1])
+        
+        # Count safe steps
+        if not any(getattr(v, "crashed", False) for v in wrapper.unwrapped.road.vehicles[:5]):
+            safe_steps += 1
+        
+        # ---- Update alpha every 5 steps -------------------------------------
+        if (t + 1) % SYNC_EVERY == 0 and t > 0:
+            # Sync leader's Q-network to followers
+            for f in followers:
+                try:
+                    f.leader_qnet = leader.own_qnet_local
+                except:
+                    pass
+            syncs += 1
+            
+            # Update alpha based on recent reward comparison
+            recent_window = min(SYNC_EVERY, len(leader_rewards))
+            if recent_window > 0:
+                avg_leader_reward = np.mean(leader_rewards[-recent_window:])
+                
+                for i, f in enumerate(followers):
+                    avg_follower_reward = np.mean(follower_rewards[i][-recent_window:])
+                    reward_diff = avg_leader_reward - avg_follower_reward
+                    
+                    # Update alpha based on performance gap
+                    if reward_diff > 0.05:  # leader doing better
+                        f.alpha = min(1.0, f.alpha + 0.02)
+                    elif reward_diff < -0.05:  # follower doing better
+                        f.alpha = max(0.0, f.alpha - 0.02)
+                    
+                    current_alphas[i] = f.alpha
+            
+            # Update wrapper's current_alpha for rendering
+            if hasattr(rec, 'env') and hasattr(rec.env, 'show_alpha'):
+                rec.env.show_alpha = current_alphas.copy()
+        
+        t += 1
+    
+    # Store episode results
+    alpha_hist["episode"].append(ep)
+    for k, v in zip(['b','g','y','p'], current_alphas):
+        alpha_hist[f"alpha_{k}"].append(v)
+    alpha_hist["syncs"].append(syncs)
+    alpha_hist["safe_steps"].append(safe_steps)
+    alpha_hist["crash"].append(crashed)
+    
+    print(f"Episode {ep} completed:")
+    print(f"  Safe steps: {safe_steps}/1500")
+    print(f"  Crashed: {crashed}")
+    print(f"  Syncs: {syncs}")
+    print(f"  Final alphas: B={current_alphas[0]:.3f}, G={current_alphas[1]:.3f}, Y={current_alphas[2]:.3f}, P={current_alphas[3]:.3f}")
+    
+    # ---- FIX 1: Close video properly (prevents memory leak) -----------------
+    rec.close()
+    if hasattr(rec, 'close_video_recorder'):
+        try:
+            rec.close_video_recorder()
+        except:
+            pass
+    
+    # ---- FIX 2: Clean up environment objects --------------------------------
+    del rec, base, wrapper, obs_list
+    gc.collect()
+
+# ----------------------------------------------------------------------
+# 8. Save CSV with final results
+# ----------------------------------------------------------------------
+df = pd.DataFrame(alpha_hist)
+csv_path = os.path.join(path_HW5, "Data_Average_Reward", "final.csv")
+df.to_csv(csv_path, index=False)
+print(f"\n{'='*60}")
+print(f"Saved results to: {csv_path}")
+print('='*60)
+print("\nSummary:")
+print(df.to_string(index=False))
